@@ -26,10 +26,12 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.drill.common.exceptions.ExecutionSetupException;
 import org.apache.drill.exec.store.parquet.ColumnDataReader;
 import org.apache.drill.exec.store.parquet.ParquetFormatPlugin;
+import org.apache.drill.exec.store.parquet.ParquetReaderStats;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -52,6 +54,7 @@ import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.schema.PrimitiveType;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Stopwatch;
 
 // class to keep track of the read position of variable length columns
 final class PageReader {
@@ -103,12 +106,14 @@ final class PageReader {
 
   private final CodecFactory codecFactory;
 
+  private final ParquetReaderStats stats;
+
   PageReader(ColumnReader<?> parentStatus, FileSystem fs, Path path, ColumnChunkMetaData columnChunkMetaData)
     throws ExecutionSetupException{
     this.parentColumnReader = parentStatus;
     allocatedDictionaryBuffers = new ArrayList<ByteBuf>();
     codecFactory = parentColumnReader.parentReader.getCodecFactory();
-
+    this.stats = parentColumnReader.parentReader.parquetReaderStats;
     long start = columnChunkMetaData.getFirstDataPageOffset();
     try {
       FSDataInputStream f = fs.open(path);
@@ -124,9 +129,15 @@ final class PageReader {
 
   private void loadDictionaryIfExists(final ColumnReader<?> parentStatus,
       final ColumnChunkMetaData columnChunkMetaData, final FSDataInputStream f) throws IOException {
+    Stopwatch timer = new Stopwatch();
     if (columnChunkMetaData.getDictionaryPageOffset() > 0) {
       f.seek(columnChunkMetaData.getDictionaryPageOffset());
+      long start=f.getPos();
       final PageHeader pageHeader = Util.readPageHeader(f);
+      long timeToRead = timer.elapsed(TimeUnit.MICROSECONDS);
+      timer.reset();
+      long pageHeaderBytes=f.getPos()-start;
+      this.updateStats(pageHeader, "Page Header", timeToRead, pageHeaderBytes, pageHeaderBytes);
       assert pageHeader.type == PageType.DICTIONARY_PAGE;
       readDictionaryPage(pageHeader, parentStatus);
     }
@@ -138,7 +149,7 @@ final class PageReader {
     int uncompressedSize = pageHeader.getUncompressed_page_size();
 
     final DrillBuf dictionaryData = allocateDictionaryBuffer(uncompressedSize);
-    readPage(compressedSize, uncompressedSize, dictionaryData);
+    readPage(pageHeader, compressedSize, uncompressedSize, dictionaryData);
 
     DictionaryPage page = new DictionaryPage(
         asBytesInput(dictionaryData, 0, uncompressedSize),
@@ -149,25 +160,33 @@ final class PageReader {
     this.dictionary = page.getEncoding().initDictionary(parentStatus.columnDescriptor, page);
   }
 
-  public void readPage(int compressedSize, int uncompressedSize, DrillBuf dest) throws IOException {
-    if (parentColumnReader.columnChunkMetaData.getCodec() == CompressionCodecName.UNCOMPRESSED) {
-      dataReader.loadPage(dest, compressedSize);
-    } else {
+  public void readPage(PageHeader pageHeader, int compressedSize, int uncompressedSize, DrillBuf dest) throws IOException {
+      Stopwatch timer = new Stopwatch();
+      long timeToRead;
+      if (parentColumnReader.columnChunkMetaData.getCodec() == CompressionCodecName.UNCOMPRESSED) {
+        timer.start();
+        dataReader.loadPage(dest, compressedSize);
+        timeToRead = timer.elapsed(TimeUnit.MICROSECONDS);
+        this.updateStats(pageHeader, "Page Read", timeToRead, compressedSize, uncompressedSize);
+      } else {
       final DrillBuf compressedData = allocateTemporaryBuffer(compressedSize);
-      try {
+        try {
+        timer.start();
         dataReader.loadPage(compressedData, compressedSize);
+        timeToRead = timer.elapsed(TimeUnit.MICROSECONDS);
+        timer.reset();
+        this.updateStats(pageHeader, "Page Read", timeToRead, compressedSize, compressedSize);
+        timer.start();
         codecFactory.getDecompressor(parentColumnReader.columnChunkMetaData
-            .getCodec()).decompress(
-            compressedData.nioBuffer(0, compressedSize),
-            compressedSize,
-            dest.nioBuffer(0, uncompressedSize),
-            uncompressedSize);
-
-      } finally {
-        compressedData.release();
+            .getCodec()).decompress(compressedData.nioBuffer(0, compressedSize), compressedSize,
+            dest.nioBuffer(0, uncompressedSize), uncompressedSize);
+          timeToRead = timer.elapsed(TimeUnit.MICROSECONDS);
+          this.updateStats(pageHeader, "Decompress", timeToRead, compressedSize, uncompressedSize);
+        } finally {
+          compressedData.release();
+        }
       }
     }
-  }
 
   public static BytesInput asBytesInput(DrillBuf buf, int offset, int length) throws IOException {
     return BytesInput.from(buf.nioBuffer(offset, length), 0, length);
@@ -180,7 +199,7 @@ final class PageReader {
    * @throws java.io.IOException
    */
   public boolean next() throws IOException {
-
+    Stopwatch timer = new Stopwatch();
     currentPageCount = -1;
     valuesRead = 0;
     valuesReadyToRead = 0;
@@ -207,7 +226,7 @@ final class PageReader {
     allocatePageData(pageHeader.getUncompressed_page_size());
     int compressedSize = pageHeader.getCompressed_page_size();
     int uncompressedSize = pageHeader.getUncompressed_page_size();
-    readPage(compressedSize, uncompressedSize, pageData);
+    readPage(pageHeader, compressedSize, uncompressedSize, pageData);
 
     currentPageCount = pageHeader.data_page_header.num_values;
 
@@ -296,6 +315,37 @@ final class PageReader {
 
   protected boolean hasPage() {
     return currentPageCount != -1;
+  }
+
+  private void updateStats(PageHeader pageHeader, String op, long time, long bytesin, long bytesout) {
+    String pageType = "Data Page";
+    if (pageHeader.type == PageType.DICTIONARY_PAGE) {
+      pageType = "Dictionary Page";
+    }
+    logger.trace("ParquetTrace,{},{},{},{},{},{},{}", op, pageType.toString(),
+        this.parentColumnReader.parentReader.hadoopPath,
+        this.parentColumnReader.columnDescriptor.toString(), bytesin, bytesout, time);
+    if (pageHeader.type != PageType.DICTIONARY_PAGE) {
+      if (bytesin == bytesout) {
+        this.stats.timePageLoads += time;
+        this.stats.numPageLoads++;
+        this.stats.totalPageReadBytes += bytesin;
+      } else {
+        this.stats.timePagesDecompressed += time;
+        this.stats.numPagesDecompressed++;
+        this.stats.totalDecompressedBytes += bytesin;
+      }
+    } else {
+      if (bytesin == bytesout) {
+        this.stats.timeDictPageLoads += time;
+        this.stats.numDictPageLoads++;
+        this.stats.totalDictPageReadBytes += bytesin;
+      } else {
+        this.stats.timeDictPagesDecompressed += time;
+        this.stats.numDictPagesDecompressed++;
+        this.stats.totalDictDecompressedBytes += bytesin;
+      }
+    }
   }
 
   public void clearBuffers() {
