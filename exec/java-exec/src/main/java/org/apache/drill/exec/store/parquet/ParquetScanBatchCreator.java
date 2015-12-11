@@ -130,7 +130,7 @@ public class ParquetScanBatchCreator implements BatchCreator<ParquetRowGroupScan
           ParquetMetadata footer = ParquetFileReader.readFooter(conf, new Path(e.getPath()));
           long timeToRead = timer.elapsed(TimeUnit.MICROSECONDS);
           timer.reset();
-          logger.trace("ParquetTrace,Read Footer,{},{},{},{},{},{}", "", e.getPath(), "", 0, 0, timeToRead);
+          logger.trace("ParquetTrace,Read Footer,{},{},{},{},{},{},{}", "", e.getPath(), "", 0, 0, 0, timeToRead);
           footers.put(e.getPath(), footer );
         }
         if (!context.getOptions().getOption(ExecConstants.PARQUET_NEW_RECORD_READER).bool_val && !isComplex(footers.get(e.getPath()))) {
