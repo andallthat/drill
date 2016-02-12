@@ -119,7 +119,7 @@ connectionStatus_t DrillClientImpl::connect(const char* connStr){
                 //    ZookeeperImpl::s_counter++;
                 //	DRILL_LOG(LOG_TRACE) << "Current Zookeeper counter is: " << ZookeeperImpl::s_counter++ << std::endl;
                 //}
-                err = zook.getEndPoint(drillbits, drillbits.size(), endpoint);// get the last one in the list
+                err = zook.getEndPoint(drillbits, drillbits.size()-1, endpoint);// get the last one in the list
                 if(!err){
                     host=boost::lexical_cast<std::string>(endpoint.address());
                     port=boost::lexical_cast<std::string>(endpoint.user_port());
